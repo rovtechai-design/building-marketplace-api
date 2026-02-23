@@ -8,7 +8,6 @@ from app.models.user import User
 
 
 async def get_db():
-
     async with SessionLocal() as session:
         yield session
 
@@ -22,10 +21,8 @@ async def get_current_user(
 
     token = authorization.split(" ", 1)[1].strip()
 
-    try:
-        decoded = verify_firebase_token(token)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    # ✅ DO NOT swallow the real Firebase error
+    decoded = verify_firebase_token(token)
 
     firebase_uid = decoded.get("uid")
     email = decoded.get("email")
