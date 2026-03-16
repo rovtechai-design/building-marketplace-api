@@ -8,6 +8,7 @@ from app.core.db import test_connection, create_tables
 from app.api.routes.me import router as me_router
 from app.api.routes.buildings import router as buildings_router
 from app.api.routes.listings import router as listings_router
+from app.api.routes.moderation import router as moderation_router
 
 
 @asynccontextmanager
@@ -27,6 +28,7 @@ app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 app.include_router(me_router)
 app.include_router(buildings_router)
 app.include_router(listings_router)
+app.include_router(moderation_router)
 
 
 @app.get("/health")

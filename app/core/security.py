@@ -1,10 +1,15 @@
+import logging
 import os
-import firebase_admin
-from firebase_admin import credentials, auth
-from fastapi import HTTPException
 import traceback
+from time import perf_counter
+
+import firebase_admin
+from fastapi import HTTPException
+from firebase_admin import auth, credentials
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def init_firebase():
@@ -14,28 +19,33 @@ def init_firebase():
     except ValueError:
         pass
 
-    # 🔎 DEBUG: show exactly what file is being used
-    print("🔥 FIREBASE_SERVICE_ACCOUNT_JSON setting =", settings.FIREBASE_SERVICE_ACCOUNT_JSON)
-    print("🔥 Absolute path =", os.path.abspath(settings.FIREBASE_SERVICE_ACCOUNT_JSON))
-
+    logger.info(
+        "firebase.init start service_account_path=%s absolute_path=%s",
+        settings.FIREBASE_SERVICE_ACCOUNT_JSON,
+        os.path.abspath(settings.FIREBASE_SERVICE_ACCOUNT_JSON),
+    )
     cred = credentials.Certificate(settings.FIREBASE_SERVICE_ACCOUNT_JSON)
-
-    # 🔎 DEBUG: confirm which project this service account belongs to
-    print("🔥 Loaded service account project_id =", cred.project_id)
-
+    logger.info("firebase.init loaded project_id=%s", cred.project_id)
     firebase_admin.initialize_app(cred)
+    logger.info("firebase.init complete")
 
 
 def verify_firebase_token(id_token: str):
+    verify_started_at = perf_counter()
+    logger.info("firebase.verify start token_length=%s", len(id_token))
     init_firebase()
     try:
-        return auth.verify_id_token(id_token, check_revoked=False)
-    except Exception as e:
-        print("🔥 FIREBASE TOKEN VERIFY FAILED")
-        print("Type:", type(e))
-        print("Message:", str(e))
+        decoded = auth.verify_id_token(id_token, check_revoked=False)
+        logger.info(
+            "firebase.verify success uid=%s elapsed_ms=%.2f",
+            decoded.get("uid"),
+            (perf_counter() - verify_started_at) * 1000,
+        )
+        return decoded
+    except Exception as exc:
+        logger.error("firebase.verify failed type=%s message=%s", type(exc).__name__, str(exc))
         traceback.print_exc()
         raise HTTPException(
             status_code=401,
-            detail=f"Firebase verify failed: {type(e).__name__}: {e}",
-        )
+            detail=f"Firebase verify failed: {type(exc).__name__}: {exc}",
+        ) from exc

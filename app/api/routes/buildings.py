@@ -41,6 +41,11 @@ async def join_building(
 
     membership = BuildingMembership(user_id=user.id, building_id=building.id)
     db.add(membership)
+    if user.building_id is None:
+        user.building_id = building.id
+        user.profile_completed = bool(
+            user.display_name and user.full_name and user.room_number_private
+        )
 
     try:
         await db.commit()

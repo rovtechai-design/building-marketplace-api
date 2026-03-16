@@ -1,9 +1,6 @@
-import uuid
-from datetime import datetime
-
-from sqlalchemy import String, DateTime, func, Integer, ForeignKey, Text, Numeric
+from sqlalchemy import String, DateTime, func, Integer, ForeignKey, Text, Numeric, text
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import mapped_column
+from sqlalchemy.orm import mapped_column, relationship
 
 from app.models.base import Base
 
@@ -18,15 +15,17 @@ class Listing(Base):
 
     user_id = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     building_id = mapped_column(Integer, ForeignKey("buildings.id", ondelete="CASCADE"), nullable=False)
+    status = mapped_column(String(32), nullable=False, server_default=text("'active'"))
+    images = relationship(
+        "ListingImage",
+        back_populates="listing",
+        cascade="all, delete-orphan",
+    )
+    reports = relationship(
+        "ListingReport",
+        back_populates="listing",
+        cascade="all, delete-orphan",
+    )
 
     created_at = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     expires_at = mapped_column(DateTime(timezone=True), nullable=True)
-
-
-class ListingImage(Base):
-    __tablename__ = "listing_images"
-
-    id = mapped_column(Integer, primary_key=True, autoincrement=True)
-    listing_id = mapped_column(Integer, ForeignKey("listings.id", ondelete="CASCADE"), nullable=False)
-    image_url = mapped_column(Text, nullable=False)
-    created_at = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

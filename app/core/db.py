@@ -5,7 +5,7 @@ from app.core.config import settings
 
 # Register models so SQLAlchemy knows them
 from app.models.base import Base
-from app.models import user, building, listing
+from app.models import user, building, listing, listing_image, listing_report
 
 engine = create_async_engine(settings.DATABASE_URL, pool_pre_ping=True)
 SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
