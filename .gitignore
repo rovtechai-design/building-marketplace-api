@@ -40,3 +40,4 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+tmp_report_audit.db
