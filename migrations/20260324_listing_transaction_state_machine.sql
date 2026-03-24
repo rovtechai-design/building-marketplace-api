@@ -1,0 +1,5 @@
+ALTER TABLE listings
+ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ;
+
+ALTER TABLE listings
+ADD COLUMN IF NOT EXISTS transaction_pin VARCHAR(4);

@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from sqlalchemy import select
 
@@ -362,3 +364,369 @@ async def test_flow_6_admin_override_for_kevin_account(client, db_sessionmaker, 
     moderation_response = await client.get("/moderation/reports", headers=auth_headers("kevin"))
     assert moderation_response.status_code == 200
     assert moderation_response.json()["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_flow_7_buy_listing_reserves_listing_and_generates_buyer_pin(client, db_sessionmaker, token_claims):
+    building = await create_building(db_sessionmaker, name="Golf House", invite_code="GOLF123")
+    users = [
+        ("seller", "seller@example.com", "Tomato", "Seller", "1A"),
+        ("buyer", "buyer@example.com", "Carrot", "Buyer", "2A"),
+        ("viewer", "viewer@example.com", "Bean", "Viewer", "3A"),
+    ]
+
+    for token, email, alias, full_name, room in users:
+        token_claims[token] = {"uid": f"uid-{token}", "email": email, "name": alias}
+        await client.get("/me", headers=auth_headers(token))
+        await client.post("/join-building", json={"invite_code": building.invite_code}, headers=auth_headers(token))
+        await client.patch(
+            "/me",
+            json={
+                "display_name": alias,
+                "full_name": full_name,
+                "building_id": building.id,
+                "room_number_private": room,
+            },
+            headers=auth_headers(token),
+        )
+
+    create_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Monitor", "description": "27 inch", "price": 90},
+        headers=auth_headers("seller"),
+    )
+    listing_id = create_listing_response.json()["id"]
+
+    buy_response = await client.post(f"/listings/{listing_id}/buy", headers=auth_headers("buyer"))
+    assert buy_response.status_code == 200
+    payload = buy_response.json()
+    assert payload["success"] is True
+    assert payload["listing_id"] == listing_id
+    assert payload["status"] == "in_progress"
+    assert payload["buyer_user_id"] is not None
+    assert payload["reserved_at"] is not None
+
+    feed_response = await client.get(
+        "/listings",
+        params={"building_id": building.id},
+        headers=auth_headers("viewer"),
+    )
+    assert feed_response.status_code == 200
+    assert feed_response.json()["count"] == 0
+
+    seller_listings_response = await client.get("/my-listings", headers=auth_headers("seller"))
+    assert seller_listings_response.status_code == 200
+    seller_listing = seller_listings_response.json()["listings"][0]
+    assert seller_listing["status"] == "in_progress"
+    assert seller_listing["buyer_user_id"] == payload["buyer_user_id"]
+    assert seller_listing["buyer_display_name"] == "Carrot"
+    assert seller_listing["reserved_at"] is not None
+    assert seller_listing["sold_at"] is None
+    assert "transaction_pin" not in seller_listing
+    assert "buyer_pin" not in seller_listing
+
+    buyer_orders_response = await client.get("/orders/me", headers=auth_headers("buyer"))
+    assert buyer_orders_response.status_code == 200
+    buyer_order = buyer_orders_response.json()["orders"][0]
+    assert buyer_order["listing_id"] == listing_id
+    assert buyer_order["status"] == "in_progress"
+    assert buyer_order["buyer_pin"] is not None
+    assert len(buyer_order["buyer_pin"]) == 4
+    assert buyer_order["buyer_pin"].isdigit()
+    assert buyer_order["has_buyer_pin"] is True
+    assert buyer_order["reserved_at"] == payload["reserved_at"]
+    assert buyer_order["sold_at"] is None
+
+    async with db_sessionmaker() as session:
+        result = await session.execute(select(Listing).where(Listing.id == listing_id))
+        listing = result.scalar_one()
+        assert listing.status == "in_progress"
+        assert str(listing.buyer_user_id) == payload["buyer_user_id"]
+        assert listing.reserved_at is not None
+        assert listing.sold_at is None
+        assert listing.transaction_pin == buyer_order["buyer_pin"]
+
+
+@pytest.mark.asyncio
+async def test_flow_8_buy_listing_rejects_invalid_purchase_states(client, db_sessionmaker, token_claims):
+    building = await create_building(db_sessionmaker, name="Hotel House", invite_code="HOTEL123")
+    token_claims["seller"] = {"uid": "uid-seller", "email": "seller@example.com", "name": "Tomato"}
+    token_claims["buyer"] = {"uid": "uid-buyer", "email": "buyer@example.com", "name": "Carrot"}
+    token_claims["outsider"] = {"uid": "uid-outsider", "email": "outsider@example.com", "name": "Bean"}
+
+    for token, full_name, room in [("seller", "Seller", "1A"), ("buyer", "Buyer", "2A")]:
+        await client.get("/me", headers=auth_headers(token))
+        await client.post("/join-building", json={"invite_code": building.invite_code}, headers=auth_headers(token))
+        await client.patch(
+            "/me",
+            json={
+                "display_name": token_claims[token]["name"],
+                "full_name": full_name,
+                "building_id": building.id,
+                "room_number_private": room,
+            },
+            headers=auth_headers(token),
+        )
+
+    await client.get("/me", headers=auth_headers("outsider"))
+
+    create_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Lamp", "description": "Desk lamp", "price": 15},
+        headers=auth_headers("seller"),
+    )
+    listing_id = create_listing_response.json()["id"]
+
+    hidden_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Hidden Lamp", "description": "Hidden", "price": 16},
+        headers=auth_headers("seller"),
+    )
+    hidden_listing_id = hidden_listing_response.json()["id"]
+
+    deleted_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Deleted Lamp", "description": "Deleted", "price": 17},
+        headers=auth_headers("seller"),
+    )
+    deleted_listing_id = deleted_listing_response.json()["id"]
+
+    expired_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Expired Lamp", "description": "Expired", "price": 18},
+        headers=auth_headers("seller"),
+    )
+    expired_listing_id = expired_listing_response.json()["id"]
+
+    async with db_sessionmaker() as session:
+        result = await session.execute(
+            select(Listing).where(
+                Listing.id.in_(
+                    [
+                        hidden_listing_id,
+                        deleted_listing_id,
+                        expired_listing_id,
+                    ]
+                )
+            )
+        )
+        listings = {listing.id: listing for listing in result.scalars().all()}
+        listings[hidden_listing_id].status = "hidden"
+        listings[deleted_listing_id].status = "deleted"
+        listings[expired_listing_id].expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        await session.commit()
+
+    own_listing_response = await client.post(f"/listings/{listing_id}/buy", headers=auth_headers("seller"))
+    assert own_listing_response.status_code == 422
+
+    outsider_response = await client.post(f"/listings/{listing_id}/buy", headers=auth_headers("outsider"))
+    assert outsider_response.status_code == 403
+
+    hidden_response = await client.post(f"/listings/{hidden_listing_id}/buy", headers=auth_headers("buyer"))
+    assert hidden_response.status_code == 409
+
+    deleted_response = await client.post(f"/listings/{deleted_listing_id}/buy", headers=auth_headers("buyer"))
+    assert deleted_response.status_code == 409
+
+    expired_response = await client.post(f"/listings/{expired_listing_id}/buy", headers=auth_headers("buyer"))
+    assert expired_response.status_code == 409
+
+    first_buy_response = await client.post(f"/listings/{listing_id}/buy", headers=auth_headers("buyer"))
+    assert first_buy_response.status_code == 200
+    assert first_buy_response.json()["status"] == "in_progress"
+
+    duplicate_buy_response = await client.post(f"/listings/{listing_id}/buy", headers=auth_headers("buyer"))
+    assert duplicate_buy_response.status_code == 409
+
+    missing_auth_response = await client.post(f"/listings/{listing_id}/buy")
+    assert missing_auth_response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_flow_9_seller_confirms_pin_and_unrelated_users_cannot(client, db_sessionmaker, token_claims):
+    building = await create_building(db_sessionmaker, name="India House", invite_code="INDIA123")
+    users = [
+        ("seller", "seller@example.com", "Tomato", "Seller", "1A"),
+        ("buyer", "buyer@example.com", "Carrot", "Buyer", "2A"),
+        ("other", "other@example.com", "Bean", "Other", "3A"),
+    ]
+
+    for token, email, alias, full_name, room in users:
+        token_claims[token] = {"uid": f"uid-{token}", "email": email, "name": alias}
+        await client.get("/me", headers=auth_headers(token))
+        await client.post("/join-building", json={"invite_code": building.invite_code}, headers=auth_headers(token))
+        await client.patch(
+            "/me",
+            json={
+                "display_name": alias,
+                "full_name": full_name,
+                "building_id": building.id,
+                "room_number_private": room,
+            },
+            headers=auth_headers(token),
+        )
+
+    create_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Desk", "description": "Wood desk", "price": 40},
+        headers=auth_headers("seller"),
+    )
+    listing_id = create_listing_response.json()["id"]
+
+    await client.post(f"/listings/{listing_id}/buy", headers=auth_headers("buyer"))
+    buyer_orders_response = await client.get("/orders/me", headers=auth_headers("buyer"))
+    buyer_pin = buyer_orders_response.json()["orders"][0]["buyer_pin"]
+
+    wrong_pin_response = await client.post(
+        f"/listings/{listing_id}/confirm-pin",
+        json={"pin": "0000" if buyer_pin != "0000" else "9999"},
+        headers=auth_headers("seller"),
+    )
+    assert wrong_pin_response.status_code == 422
+
+    unrelated_response = await client.post(
+        f"/listings/{listing_id}/confirm-pin",
+        json={"pin": buyer_pin},
+        headers=auth_headers("other"),
+    )
+    assert unrelated_response.status_code == 403
+
+    buyer_cannot_confirm_response = await client.post(
+        f"/listings/{listing_id}/confirm-pin",
+        json={"pin": buyer_pin},
+        headers=auth_headers("buyer"),
+    )
+    assert buyer_cannot_confirm_response.status_code == 403
+
+    confirm_response = await client.post(
+        f"/listings/{listing_id}/confirm-pin",
+        json={"pin": buyer_pin},
+        headers=auth_headers("seller"),
+    )
+    assert confirm_response.status_code == 200
+    confirm_payload = confirm_response.json()
+    assert confirm_payload["success"] is True
+    assert confirm_payload["listing_id"] == listing_id
+    assert confirm_payload["status"] == "sold"
+    assert confirm_payload["sold_at"] is not None
+
+    seller_listings_response = await client.get("/my-listings", headers=auth_headers("seller"))
+    seller_listing = seller_listings_response.json()["listings"][0]
+    assert seller_listing["status"] == "sold"
+    assert seller_listing["reserved_at"] is not None
+    assert seller_listing["sold_at"] == confirm_payload["sold_at"]
+    assert "buyer_pin" not in seller_listing
+
+    buyer_orders_after_response = await client.get("/orders/me", headers=auth_headers("buyer"))
+    buyer_order = buyer_orders_after_response.json()["orders"][0]
+    assert buyer_order["status"] == "sold"
+    assert buyer_order["buyer_pin"] is None
+    assert buyer_order["has_buyer_pin"] is False
+    assert buyer_order["sold_at"] == confirm_payload["sold_at"]
+
+    feed_response = await client.get(
+        "/listings",
+        params={"building_id": building.id},
+        headers=auth_headers("buyer"),
+    )
+    assert feed_response.status_code == 200
+    assert feed_response.json()["count"] == 0
+
+    async with db_sessionmaker() as session:
+        result = await session.execute(select(Listing).where(Listing.id == listing_id))
+        listing = result.scalar_one()
+        assert listing.status == "sold"
+        assert listing.sold_at is not None
+        assert listing.reserved_at is not None
+        assert listing.transaction_pin is None
+
+
+@pytest.mark.asyncio
+async def test_flow_10_orders_and_my_listings_reflect_in_progress_and_sold_states(client, db_sessionmaker, token_claims):
+    building = await create_building(db_sessionmaker, name="Juliet House", invite_code="JULIET123")
+    users = [
+        ("seller", "seller@example.com", "Tomato", "Seller", "1A"),
+        ("buyer", "buyer@example.com", "Carrot", "Buyer", "2A"),
+        ("other_buyer", "otherbuyer@example.com", "Bean", "Other Buyer", "3A"),
+    ]
+
+    for token, email, alias, full_name, room in users:
+        token_claims[token] = {"uid": f"uid-{token}", "email": email, "name": alias}
+        await client.get("/me", headers=auth_headers(token))
+        await client.post("/join-building", json={"invite_code": building.invite_code}, headers=auth_headers(token))
+        await client.patch(
+            "/me",
+            json={
+                "display_name": alias,
+                "full_name": full_name,
+                "building_id": building.id,
+                "room_number_private": room,
+            },
+            headers=auth_headers(token),
+        )
+
+    active_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Chair", "description": "Desk chair", "price": 25},
+        headers=auth_headers("seller"),
+    )
+    active_listing_id = active_listing_response.json()["id"]
+
+    in_progress_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Shelf", "description": "Wall shelf", "price": 35},
+        headers=auth_headers("seller"),
+    )
+    in_progress_listing_id = in_progress_listing_response.json()["id"]
+
+    sold_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Plant", "description": "Indoor plant", "price": 20},
+        headers=auth_headers("seller"),
+    )
+    sold_listing_id = sold_listing_response.json()["id"]
+
+    extra_in_progress_listing_response = await client.post(
+        "/listings",
+        json={"building_id": building.id, "title": "Fan", "description": "Quiet fan", "price": 18},
+        headers=auth_headers("seller"),
+    )
+    extra_in_progress_listing_id = extra_in_progress_listing_response.json()["id"]
+
+    await client.post(f"/listings/{in_progress_listing_id}/buy", headers=auth_headers("buyer"))
+    await client.post(f"/listings/{sold_listing_id}/buy", headers=auth_headers("buyer"))
+
+    sold_orders_response = await client.get("/orders/me", headers=auth_headers("buyer"))
+    sold_order = {order["listing_id"]: order for order in sold_orders_response.json()["orders"]}[sold_listing_id]
+
+    confirm_response = await client.post(
+        f"/listings/{sold_listing_id}/confirm-pin",
+        json={"pin": sold_order["buyer_pin"]},
+        headers=auth_headers("seller"),
+    )
+    assert confirm_response.status_code == 200
+
+    await client.post(f"/listings/{extra_in_progress_listing_id}/buy", headers=auth_headers("other_buyer"))
+
+    seller_listings_response = await client.get("/my-listings", headers=auth_headers("seller"))
+    assert seller_listings_response.status_code == 200
+    listings_by_id = {listing["id"]: listing for listing in seller_listings_response.json()["listings"]}
+    assert listings_by_id[active_listing_id]["status"] == "active"
+    assert listings_by_id[in_progress_listing_id]["status"] == "in_progress"
+    assert listings_by_id[sold_listing_id]["status"] == "sold"
+    assert listings_by_id[extra_in_progress_listing_id]["status"] == "in_progress"
+    assert listings_by_id[in_progress_listing_id]["reserved_at"] is not None
+    assert listings_by_id[sold_listing_id]["sold_at"] is not None
+    assert "buyer_pin" not in listings_by_id[in_progress_listing_id]
+
+    buyer_orders_response = await client.get("/orders/me", headers=auth_headers("buyer"))
+    assert buyer_orders_response.status_code == 200
+    buyer_orders = {order["listing_id"]: order for order in buyer_orders_response.json()["orders"]}
+    assert set(buyer_orders.keys()) == {in_progress_listing_id, sold_listing_id}
+    assert buyer_orders[in_progress_listing_id]["status"] == "in_progress"
+    assert buyer_orders[in_progress_listing_id]["buyer_pin"] is not None
+    assert buyer_orders[in_progress_listing_id]["has_buyer_pin"] is True
+    assert buyer_orders[sold_listing_id]["status"] == "sold"
+    assert buyer_orders[sold_listing_id]["buyer_pin"] is None
+    assert buyer_orders[sold_listing_id]["has_buyer_pin"] is False
+    assert buyer_orders[sold_listing_id]["sold_at"] is not None

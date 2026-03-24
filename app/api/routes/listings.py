@@ -1,11 +1,12 @@
 from datetime import datetime, timezone
+import secrets
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from app.api.deps import get_current_user, get_db
 from app.models.building import BuildingMembership
@@ -18,6 +19,8 @@ from app.schemas.listing_report import ListingReportCreateIn, ListingReportCreat
 from app.services.storage import upload_listing_image
 
 LISTING_STATUS_ACTIVE = "active"
+LISTING_STATUS_IN_PROGRESS = "in_progress"
+LISTING_STATUS_SOLD = "sold"
 LISTING_STATUS_HIDDEN = "hidden"
 LISTING_STATUS_DELETED = "deleted"
 REPORT_STATUS_OPEN = "open"
@@ -43,6 +46,55 @@ class ListingCreateIn(BaseModel):
     price: float | None = None
 
 
+class ListingBuyOut(BaseModel):
+    success: bool
+    listing_id: int
+    status: str
+    buyer_user_id: str
+    reserved_at: str
+
+
+class ListingConfirmPinIn(BaseModel):
+    pin: str = Field(..., min_length=4, max_length=4, pattern=r"^\d{4}$")
+
+
+class ListingConfirmPinOut(BaseModel):
+    success: bool
+    listing_id: int
+    status: str
+    sold_at: str
+
+
+class OrderSellerOut(BaseModel):
+    id: str
+    display_name: str | None = None
+
+
+class OrderOut(BaseModel):
+    id: int
+    listing_id: int
+    title: str
+    price: float | None = None
+    seller: OrderSellerOut
+    user_id: str
+    seller_display_name: str | None = None
+    buyer_user_id: str | None = None
+    status: str
+    images: list[str]
+    image_urls: list[str]
+    created_at: str | None = None
+    reserved_at: str | None = None
+    sold_at: str | None = None
+    purchased_at: str | None = None
+    buyer_pin: str | None = None
+    has_buyer_pin: bool = False
+
+
+class OrdersMeOut(BaseModel):
+    count: int
+    orders: list[OrderOut]
+
+
 async def require_membership(db: AsyncSession, user_id, building_id: int) -> None:
     q = await db.execute(
         select(BuildingMembership)
@@ -57,6 +109,14 @@ async def require_membership(db: AsyncSession, user_id, building_id: int) -> Non
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You are not a member of this building",
         )
+
+
+def serialize_datetime(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
 
 
 def compute_listing_status(listing: Listing) -> str:
@@ -75,8 +135,18 @@ def compute_listing_status(listing: Listing) -> str:
     return LISTING_STATUS_ACTIVE
 
 
-def serialize_listing(listing: Listing, seller: User | None = None) -> dict:
+def serialize_listing(
+    listing: Listing,
+    seller: User | None = None,
+    buyer: User | None = None,
+    *,
+    include_buyer_display_name: bool = False,
+) -> dict:
     seller_display_name = (seller.public_alias or seller.display_name) if seller else None
+    buyer_display_name = None
+    if include_buyer_display_name and buyer:
+        buyer_display_name = buyer.public_alias or buyer.display_name
+    image_urls = [img.image_url for img in listing.images]
     return {
         "id": listing.id,
         "building_id": listing.building_id,
@@ -85,11 +155,65 @@ def serialize_listing(listing: Listing, seller: User | None = None) -> dict:
         "price": float(listing.price) if listing.price is not None else None,
         "user_id": str(listing.user_id),
         "seller_display_name": seller_display_name,
-        "images": [img.image_url for img in listing.images],
-        "created_at": listing.created_at.isoformat() if listing.created_at else None,
-        "expires_at": listing.expires_at.isoformat() if listing.expires_at else None,
+        "images": image_urls,
+        "image_urls": image_urls,
+        "created_at": serialize_datetime(listing.created_at),
+        "expires_at": serialize_datetime(listing.expires_at),
         "status": compute_listing_status(listing),
+        "buyer_user_id": str(listing.buyer_user_id) if listing.buyer_user_id else None,
+        "buyer_display_name": buyer_display_name,
+        "reserved_at": serialize_datetime(listing.reserved_at),
+        "sold_at": serialize_datetime(listing.sold_at),
     }
+
+
+def serialize_order(listing: Listing, seller: User, *, include_buyer_pin: bool = False) -> dict:
+    seller_display_name = seller.public_alias or seller.display_name
+    image_urls = [img.image_url for img in listing.images]
+    buyer_pin = None
+    if include_buyer_pin and listing.status == LISTING_STATUS_IN_PROGRESS:
+        buyer_pin = listing.transaction_pin
+    return {
+        "id": listing.id,
+        "listing_id": listing.id,
+        "title": listing.title,
+        "price": float(listing.price) if listing.price is not None else None,
+        "seller": {
+            "id": str(seller.id),
+            "display_name": seller_display_name,
+        },
+        "user_id": str(listing.user_id),
+        "seller_display_name": seller_display_name,
+        "buyer_user_id": str(listing.buyer_user_id) if listing.buyer_user_id else None,
+        "status": listing.status,
+        "images": image_urls,
+        "image_urls": image_urls,
+        "created_at": serialize_datetime(listing.created_at),
+        "reserved_at": serialize_datetime(listing.reserved_at),
+        "sold_at": serialize_datetime(listing.sold_at),
+        "purchased_at": (
+            serialize_datetime(listing.reserved_at) if listing.reserved_at else serialize_datetime(listing.sold_at)
+        ),
+        "buyer_pin": buyer_pin,
+        "has_buyer_pin": buyer_pin is not None,
+    }
+
+
+async def get_listing_with_people(
+    db: AsyncSession,
+    *,
+    listing_id: int,
+) -> tuple[Listing | None, User | None, User | None]:
+    seller = aliased(User)
+    buyer = aliased(User)
+    result = await db.execute(
+        select(Listing, seller, buyer)
+        .join(seller, seller.id == Listing.user_id)
+        .outerjoin(buyer, buyer.id == Listing.buyer_user_id)
+        .options(selectinload(Listing.images))
+        .where(Listing.id == listing_id)
+    )
+    return result.one_or_none() or (None, None, None)
 
 
 async def create_listing_report(
@@ -162,6 +286,125 @@ async def create_listing_report(
     )
 
 
+async def buy_listing_for_user(
+    *,
+    listing_id: int,
+    user: User,
+    db: AsyncSession,
+) -> ListingBuyOut:
+    listing, _, _ = await get_listing_with_people(db, listing_id=listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    await require_membership(db, user.id, listing.building_id)
+
+    if str(listing.user_id) == str(user.id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="You cannot buy your own listing",
+        )
+
+    if compute_listing_status(listing) != LISTING_STATUS_ACTIVE:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Listing is not available for purchase",
+        )
+
+    reserved_at = datetime.now(timezone.utc)
+    transaction_pin = f"{secrets.randbelow(10000):04d}"
+    result = await db.execute(
+        update(Listing)
+        .where(
+            Listing.id == listing.id,
+            Listing.status == LISTING_STATUS_ACTIVE,
+            Listing.buyer_user_id.is_(None),
+        )
+        .values(
+            status=LISTING_STATUS_IN_PROGRESS,
+            buyer_user_id=user.id,
+            reserved_at=reserved_at,
+            sold_at=None,
+            transaction_pin=transaction_pin,
+        )
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Listing was already purchased",
+        )
+
+    await db.commit()
+
+    return ListingBuyOut(
+        success=True,
+        listing_id=listing.id,
+        status=LISTING_STATUS_IN_PROGRESS,
+        buyer_user_id=str(user.id),
+        reserved_at=reserved_at.isoformat(),
+    )
+
+
+async def confirm_listing_pin_for_seller(
+    *,
+    listing_id: int,
+    pin: str,
+    user: User,
+    db: AsyncSession,
+) -> ListingConfirmPinOut:
+    listing, _, _ = await get_listing_with_people(db, listing_id=listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    await require_membership(db, user.id, listing.building_id)
+
+    if str(listing.user_id) != str(user.id):
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+    if listing.status != LISTING_STATUS_IN_PROGRESS or not listing.buyer_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Listing is not awaiting PIN confirmation",
+        )
+
+    if listing.transaction_pin != pin:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid transaction PIN",
+        )
+
+    sold_at = datetime.now(timezone.utc)
+    result = await db.execute(
+        update(Listing)
+        .where(
+            Listing.id == listing.id,
+            Listing.user_id == user.id,
+            Listing.status == LISTING_STATUS_IN_PROGRESS,
+            Listing.transaction_pin == pin,
+        )
+        .values(
+            status=LISTING_STATUS_SOLD,
+            sold_at=sold_at,
+            transaction_pin=None,
+        )
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Listing could not be confirmed",
+        )
+
+    await db.commit()
+
+    return ListingConfirmPinOut(
+        success=True,
+        listing_id=listing.id,
+        status=LISTING_STATUS_SOLD,
+        sold_at=sold_at.isoformat(),
+    )
+
+
 @router.post("/listings")
 async def create_listing(
     payload: ListingCreateIn,
@@ -205,9 +448,10 @@ async def list_listings(
 ):
     await require_membership(db, user.id, building_id)
 
+    seller = aliased(User)
     q = await db.execute(
-        select(Listing, User)
-        .join(User, User.id == Listing.user_id)
+        select(Listing, seller)
+        .join(seller, seller.id == Listing.user_id)
         .options(selectinload(Listing.images))
         .where(
             Listing.building_id == building_id,
@@ -219,7 +463,7 @@ async def list_listings(
 
     return {
         "count": len(rows),
-        "listings": [serialize_listing(listing, seller) for listing, seller in rows],
+        "listings": [serialize_listing(listing, seller_row) for listing, seller_row in rows],
     }
 
 
@@ -228,9 +472,12 @@ async def list_my_listings(
     user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    seller = aliased(User)
+    buyer = aliased(User)
     q = await db.execute(
-        select(Listing, User)
-        .join(User, User.id == Listing.user_id)
+        select(Listing, seller, buyer)
+        .join(seller, seller.id == Listing.user_id)
+        .outerjoin(buyer, buyer.id == Listing.buyer_user_id)
         .options(selectinload(Listing.images))
         .where(Listing.user_id == user.id)
         .order_by(Listing.created_at.desc())
@@ -239,8 +486,69 @@ async def list_my_listings(
 
     return {
         "count": len(rows),
-        "listings": [serialize_listing(listing, seller) for listing, seller in rows],
+        "listings": [
+            serialize_listing(
+                listing,
+                seller_row,
+                buyer_row,
+                include_buyer_display_name=True,
+            )
+            for listing, seller_row, buyer_row in rows
+        ],
     }
+
+
+@router.get("/orders/me", response_model=OrdersMeOut)
+async def list_my_orders(
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    seller = aliased(User)
+    q = await db.execute(
+        select(Listing, seller)
+        .join(seller, seller.id == Listing.user_id)
+        .options(selectinload(Listing.images))
+        .where(Listing.buyer_user_id == user.id)
+        .where(Listing.status.in_([LISTING_STATUS_IN_PROGRESS, LISTING_STATUS_SOLD]))
+        .order_by(Listing.reserved_at.desc(), Listing.sold_at.desc(), Listing.created_at.desc())
+    )
+    rows = q.all()
+
+    return {
+        "count": len(rows),
+        "orders": [
+            serialize_order(listing, seller_row, include_buyer_pin=True)
+            for listing, seller_row in rows
+        ],
+    }
+
+
+@router.post("/listings/{listing_id}/buy", response_model=ListingBuyOut)
+async def buy_listing(
+    listing_id: int,
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await buy_listing_for_user(
+        listing_id=listing_id,
+        user=user,
+        db=db,
+    )
+
+
+@router.post("/listings/{listing_id}/confirm-pin", response_model=ListingConfirmPinOut)
+async def confirm_listing_pin(
+    listing_id: int,
+    payload: ListingConfirmPinIn,
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await confirm_listing_pin_for_seller(
+        listing_id=listing_id,
+        pin=payload.pin,
+        user=user,
+        db=db,
+    )
 
 
 @router.post("/listings/{listing_id}/report", response_model=ListingReportCreateOut)

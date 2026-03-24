@@ -14,6 +14,7 @@ class Listing(Base):
     price = mapped_column(Numeric(10, 2), nullable=True)
 
     user_id = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    buyer_user_id = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     building_id = mapped_column(Integer, ForeignKey("buildings.id", ondelete="CASCADE"), nullable=False)
     status = mapped_column(String(32), nullable=False, server_default=text("'active'"))
     images = relationship(
@@ -29,3 +30,6 @@ class Listing(Base):
 
     created_at = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     expires_at = mapped_column(DateTime(timezone=True), nullable=True)
+    reserved_at = mapped_column(DateTime(timezone=True), nullable=True)
+    sold_at = mapped_column(DateTime(timezone=True), nullable=True)
+    transaction_pin = mapped_column(String(4), nullable=True)

@@ -20,3 +20,35 @@ async def test_connection():
 async def create_tables():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text(
+                """
+                ALTER TABLE listings
+                ADD COLUMN IF NOT EXISTS buyer_user_id UUID REFERENCES users(id) ON DELETE SET NULL
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                """
+                ALTER TABLE listings
+                ADD COLUMN IF NOT EXISTS sold_at TIMESTAMPTZ
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                """
+                ALTER TABLE listings
+                ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                """
+                ALTER TABLE listings
+                ADD COLUMN IF NOT EXISTS transaction_pin VARCHAR(4)
+                """
+            )
+        )
