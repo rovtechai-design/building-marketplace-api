@@ -37,15 +37,14 @@ async def join_building(
         "id": str(building.id),
         "name": building.name,
         "invite_code": building.invite_code,  # OK for V1 dev/testing
+        "vouchers_enabled": building.vouchers_enabled,
     }
 
     membership = BuildingMembership(user_id=user.id, building_id=building.id)
     db.add(membership)
     if user.building_id is None:
         user.building_id = building.id
-        user.profile_completed = bool(
-            user.display_name and user.full_name and user.room_number_private
-        )
+        user.profile_completed = user.is_profile_complete
 
     try:
         await db.commit()
@@ -78,6 +77,7 @@ async def my_buildings(
                 "id": str(b.id),
                 "name": b.name,
                 "invite_code": b.invite_code,  # OK for V1 dev/testing
+                "vouchers_enabled": b.vouchers_enabled,
             }
             for b in buildings
         ],
